@@ -1,0 +1,2301 @@
+import numpy as np
+from collections import deque
+import math
+import time
+import os
+
+# Optional Numba acceleration
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except Exception:
+    NUMBA_AVAILABLE = False
+
+# Global neuron ID counter
+_next_id = 0
+def _uid():
+    global _next_id
+    _next_id += 1
+    return _next_id - 1
+
+# ======================================================================
+#  PROJECTION TYPE PRESETS
+# ======================================================================
+PROJECTION = {
+    "feedforward": dict(
+        weight_range = (0.50, 0.65),
+        delay_range  = (5,  10),
+        learn_rate   = 0.001,
+    ),
+    "feedback": dict(
+        weight_range = (0.15, 0.35),
+        delay_range  = (10, 18),
+        learn_rate   = 0.001,
+    ),
+    "modulatory": dict(
+        weight_range = (0.05, 0.20),
+        delay_range  = (15, 25),
+        learn_rate   = 0.0005,
+    ),
+}
+
+def gamma_delay(delay_range):
+    min_d, max_d = delay_range
+    raw = np.random.gamma(2.0, 1.5)
+    delay = int(round(min_d + raw))
+    delay = max(min_d, min(delay, max_d))
+    return delay
+
+# ======================================================================
+#  BrainNeuron – V16: serotonin gain for D2 MSNs
+# ======================================================================
+class BrainNeuron:
+    def __init__(self, tau_m=20.0, threshold=0.55, v_reset=0.0,
+                 refractory=5, noise_std=0.008, target_rate=15.0,
+                 adapt_gain=0.005, adapt_tau=200.0, layer=0,
+                 cell_type="excitatory", has_t_current=False, biophysical=False):
+        self.id              = _uid()
+        self.tau_m           = tau_m
+        self.base_threshold  = threshold
+        self.v_reset         = v_reset
+        self.v               = v_reset
+        self.refractory      = refractory
+        self.last_spike_time = -1000
+        self.noise_std       = noise_std
+        self.tau_noise       = 5.0
+        self.eta             = 0.0
+        self.spike_times     = []
+        self.v_history       = []
+        self.record_history  = True
+        self._pending_I      = 0.0
+        self.layer           = layer
+        self.cell_type       = cell_type
+        self.has_t_current   = has_t_current
+        self.biophysical     = biophysical
+
+        self.g_ahp           = 0.0
+        self.adapt_gain      = adapt_gain
+        self.adapt_tau       = adapt_tau
+
+        self.target_rate     = target_rate
+        self._scale          = np.random.uniform(0.85, 1.15)
+        self._homeo_eta      = 0.05
+        self._spike_counter  = 0
+        self._rate_estimate  = target_rate
+
+        self.fatigue         = 0.0
+        self.max_fatigue     = 0.3
+        self.spike_cost      = 0.035
+        self.fatigue_recovery_wake = 0.0005
+        self.fatigue_recovery_sleep = 0.005
+
+        self.g_ampa = 0.0
+        self.g_gaba = 0.0
+        self.tau_ampa = 5.0
+        self.tau_gaba = 10.0
+        self.E_exc = 0.85
+        self.E_inh = -0.15
+
+        # Optional: switch to explicit biophysical units (mV, pF, nS, pA)
+        if self.biophysical:
+            # if user left the normalized defaults, replace with typical biophysical values
+            if threshold == 0.55:
+                self.base_threshold = -50.0  # mV
+            if v_reset == 0.0:
+                self.v_reset = -65.0  # mV
+            self.v = self.v_reset
+            self.Cm = 200.0   # pF
+            self.E_leak = self.v_reset
+            # membrane leak conductance (nS) approximated from tau_m: g = C / tau
+            # (units: pF / ms -> nS)
+            self.g_leak = self.Cm / self.tau_m
+            self.E_exc = 0.0    # mV
+            self.E_inh = -75.0  # mV
+            self.E_ahp = -90.0  # mV (K+ reversal)
+            # ensure synaptic conductances exist in the right units
+            self.g_ampa = 0.0
+            self.g_gaba = 0.0
+
+        if has_t_current:
+            self.h_T = 0.0
+            self.I_burst = 0.0
+            self.tau_T_act = 20.0
+            self.tau_T_deact = 50.0
+            self.E_Ca = 1.2
+
+    def receive(self, I):
+        self._pending_I += I * self._scale if I > 0 else I
+
+    def step(self, t, dt=1.0, norepinephrine=0.0, serotonin=0.0):
+        # Ornstein-Uhlenbeck noise (same semantics, units depend on mode)
+        self.eta += dt * (-self.eta / self.tau_noise) + \
+                    np.sqrt(2 * dt / self.tau_noise) * self.noise_std * np.random.normal()
+
+        # Decay conductances / adaptation
+        self.g_ahp += dt * (-self.g_ahp / self.adapt_tau)
+        self.g_ampa += dt * (-self.g_ampa / self.tau_ampa)
+        self.g_gaba += dt * (-self.g_gaba / self.tau_gaba)
+
+        if self.has_t_current:
+            self.I_burst += dt * (-self.I_burst / 8.0)
+
+        # refractory handling
+        if t - self.last_spike_time < self.refractory:
+            self._pending_I = 0.0
+            if self.record_history:
+                self.v_history.append(self.v_reset)
+            return 0
+
+        effective_threshold = self.base_threshold + self.fatigue
+
+        if not self.biophysical:
+            # legacy normalized integrate-and-fire update
+            I_ampa = self.g_ampa * (self.E_exc - self.v) * self._scale   # homeostasis scales AMPA
+            I_gaba = self.g_gaba * (self.E_inh - self.v)
+            I_burst = self.I_burst if self.has_t_current else 0.0
+            effective_I = self._pending_I + I_ampa + I_gaba - self.g_ahp + self.eta + I_burst
+
+            # neuromodulator gain modulation
+            effective_I *= (1.0 + 0.05 * norepinephrine)
+            if self.cell_type == "D2_MSN":
+                effective_I *= (1.0 + 0.3 * serotonin)
+
+            self.v += dt * (-self.v / self.tau_m + effective_I)
+            self.v  = max(self.v, self.v_reset)
+            self._pending_I = 0.0
+
+            if self.has_t_current:
+                if self.v < -0.2:
+                    self.h_T += dt * (1.0 - self.h_T) / self.tau_T_act
+                else:
+                    self.h_T += dt * (0.0 - self.h_T) / self.tau_T_deact
+                self.h_T = np.clip(self.h_T, 0.0, 1.0)
+        else:
+            # Biophysical conductance-based update (units: mV, pF, nS, pA)
+            I_leak = self.g_leak * (self.E_leak - self.v)
+            I_ampa = self.g_ampa * (self.E_exc - self.v) * self._scale
+            I_gaba = self.g_gaba * (self.E_inh - self.v)
+            I_ahp = self.g_ahp * (self.E_ahp - self.v)
+            I_burst = self.I_burst if self.has_t_current else 0.0
+            I_ext = self._pending_I
+            I_noise = self.eta
+
+            I_total = I_leak + I_ampa + I_gaba + I_ahp + I_burst + I_noise + I_ext
+
+            # neuromodulator gain modulation
+            I_total *= (1.0 + 0.05 * norepinephrine)
+            if self.cell_type == "D2_MSN":
+                I_total *= (1.0 + 0.3 * serotonin)
+
+            # dv/dt = I_total / Cm  (pA / pF = mV/ms)
+            self.v += dt * (I_total / self.Cm)
+            self.v = max(self.v, self.v_reset)
+            self._pending_I = 0.0
+
+            if self.has_t_current:
+                if self.v < -65.0:
+                    self.h_T += dt * (1.0 - self.h_T) / self.tau_T_act
+                else:
+                    self.h_T += dt * (0.0 - self.h_T) / self.tau_T_deact
+                self.h_T = np.clip(self.h_T, 0.0, 1.0)
+
+        # Spike detection (shared behavior)
+        if self.v >= effective_threshold:
+            if self.record_history:
+                self.v_history.append(effective_threshold)
+            self.last_spike_time = t
+            self.v = self.v_reset
+            self.spike_times.append(t)
+            # adaptation increment: treated as conductance in biophysical mode
+            self.g_ahp += self.adapt_gain
+            self.fatigue = min(self.fatigue + self.spike_cost, self.max_fatigue)
+            self._spike_counter += 1
+            if self.has_t_current and self.h_T > 0.4:
+                self.I_burst += 0.12
+            return 1
+
+        if self.record_history:
+            self.v_history.append(self.v)
+        return 0
+
+    def homeostatic_step(self, window_ms=100):
+        if window_ms <= 0:
+            return
+        recent_rate = self._spike_counter / (window_ms * 0.001)
+        self._rate_estimate = 0.9 * self._rate_estimate + 0.1 * recent_rate
+        error = self.target_rate - self._rate_estimate
+        self._scale += self._homeo_eta * error * 0.02
+        self._scale = np.clip(self._scale, 0.2, 5.0)
+        self._spike_counter = 0
+
+    @property
+    def firing_rate(self):
+        return len(self.spike_times)
+
+    def __repr__(self):
+        return f"N{self.id:02d}"
+
+# ======================================================================
+#  Synapse – V16: same as V15 (ACh+DA modulated STDP)
+# ======================================================================
+class Synapse:
+    def __init__(self, pre, post, weight=None, synapse_type="excitatory",
+                 delay=1, learn_rate=0.01,
+                 tau_ltp=17.0, tau_ltd=34.0, ltd_factor=0.65,
+                 U=0.5, tau_facil=50.0, tau_rec=200.0,
+                 use_stp=True, dopamine_receptor=None):
+        self.pre          = pre
+        self.post         = post
+        self.weight       = weight if weight is not None else np.random.uniform(0.3, 0.6)
+        self.sign         = 1.0 if synapse_type == "excitatory" else -1.0
+        self.synapse_type = synapse_type
+        self.delay        = delay
+        self.learn_rate   = learn_rate
+        self.tau_ltp      = tau_ltp
+        self.tau_ltd      = tau_ltd
+        self.ltd_factor   = ltd_factor
+        self._buffer      = deque([(0.0, None)] * delay, maxlen=delay)
+        self.use_stp      = use_stp
+        self.U            = U
+        self.tau_facil    = tau_facil
+        self.tau_rec      = tau_rec
+        # Tsodyks–Markram variables
+        self.u = U
+        self.R = 1.0
+        self.last_pre_spike = -1000
+        self.dopamine_receptor = dopamine_receptor
+
+    def deliver(self):
+        g_inc, syn_type = self._buffer.popleft()
+        if g_inc != 0.0 and syn_type is not None:
+            if syn_type == "excitatory":
+                self.post.g_ampa += g_inc
+            else:
+                self.post.g_gaba += g_inc
+
+    def enqueue(self, pre_fired):
+        if pre_fired:
+            if not self.use_stp or self.synapse_type == "inhibitory":
+                g_inc = self.weight
+            else:
+                # Tsodyks–Markram update on presynaptic spike
+                # facilitation
+                self.u = self.u + self.U * (1.0 - self.u)
+                # effective released fraction
+                release = self.u * self.R
+                # consume resources
+                self.R = max(0.0, self.R - release)
+                g_inc = self.weight * release
+                self.last_pre_spike = 0
+            self._buffer.append((g_inc, self.synapse_type))
+        else:
+            # append empty event to maintain delay buffer length
+            self._buffer.append((0.0, None))
+
+    def step(self, dt=1.0):
+        if not self.use_stp:
+            return
+        # Recovery dynamics for Tsodyks–Markram
+        # R recovers to 1.0, u decays toward baseline U
+        self.R += dt * ((1.0 - self.R) / self.tau_rec)
+        self.u += dt * (-(self.u - self.U) / self.tau_facil)
+        # clamp
+        if self.R > 1.0:
+            self.R = 1.0
+        if self.u < 0.0:
+            self.u = 0.0
+        if self.u > 1.0:
+            self.u = 1.0
+
+    def stdp_update(self, t_post, dopamine=0.0, acetylcholine=0.0):
+        delta_t = t_post - self.pre.last_spike_time
+        if delta_t > 0:
+            dw = self.learn_rate * np.exp(-delta_t / self.tau_ltp)
+        else:
+            dw = -self.learn_rate * self.ltd_factor * np.exp(delta_t / self.tau_ltd)
+        dw *= (1.0 + acetylcholine)
+        if self.dopamine_receptor == 'D1':
+            if dw > 0:
+                dw *= (1.0 + dopamine)
+            else:
+                dw *= (1.0 - 0.5 * dopamine)
+        elif self.dopamine_receptor == 'D2':
+            if dw > 0:
+                dw *= (1.0 - dopamine)
+            else:
+                dw *= (1.0 + dopamine)
+        self.weight = np.clip(self.weight + dw, 0.0, 2.0)
+
+# ======================================================================
+#  BrainRegion – V16 (interneuron targets scale with target_rate_i)
+# ======================================================================
+class BrainRegion:
+    def __init__(self, name, n_excitatory, n_inhibitory, p_connect=0.30,
+                 recurrent=False, tau_m=20.0, threshold=0.55,
+                 noise_std=0.008, refractory=5,
+                 target_rate=15.0, target_rate_i=20.0,
+                 interneuron_types=None, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.interneuron_types = interneuron_types
+
+        self.excitatory = []
+        for i in range(n_excitatory):
+            if i < n_excitatory // 3:
+                layer = 4
+            elif i < 2 * n_excitatory // 3:
+                layer = 23
+            else:
+                layer = 56
+            self.excitatory.append(
+                BrainNeuron(tau_m=tau_m, threshold=threshold,
+                            noise_std=noise_std, refractory=refractory,
+                            target_rate=target_rate,
+                            adapt_gain=0.012, adapt_tau=200.0,
+                            layer=layer, cell_type="excitatory",
+                            biophysical=biophysical))
+
+        self.inhibitory = []
+        for i in range(n_inhibitory):
+            if interneuron_types and i < len(interneuron_types):
+                int_type = interneuron_types[i]
+            else:
+                int_type = "generic"
+
+            if int_type == "PV":
+                tau_i = tau_m * 0.5
+                th_i  = threshold * 0.6
+                ag    = 0.003
+                at    = 80.0
+                ref   = max(1, refractory - 3)
+                tr    = target_rate_i * 1.25
+            elif int_type == "SST":
+                tau_i = tau_m * 0.70
+                th_i  = threshold * 0.85
+                ag    = 0.015
+                at    = 200.0
+                ref   = max(2, refractory - 1)
+                tr    = target_rate_i * 0.9
+            elif int_type == "VIP":
+                tau_i = tau_m * 0.65
+                th_i  = threshold * 0.80
+                ag    = 0.010
+                at    = 150.0
+                ref   = max(2, refractory - 2)
+                tr    = target_rate_i * 0.6
+            else:
+                tau_i = tau_m * 0.65
+                th_i  = threshold * 0.80
+                ag    = 0.008
+                at    = 150.0
+                ref   = max(2, refractory - 2)
+                tr    = target_rate_i
+
+            self.inhibitory.append(
+                BrainNeuron(tau_m=tau_i, threshold=th_i,
+                            noise_std=noise_std, refractory=ref,
+                            target_rate=tr,
+                            adapt_gain=ag, adapt_tau=at,
+                            layer=0, cell_type=int_type,
+                            biophysical=biophysical))
+
+        self.neurons = self.excitatory + self.inhibitory
+
+        n_in = max(1, n_excitatory // 3)
+        n_out = max(1, n_excitatory // 3)
+        self.input_neurons  = self.excitatory[:n_in]
+        self.output_neurons = self.excitatory[-n_out:]
+
+        self._wire(p_connect, recurrent)
+
+    def _wire(self, p, recurrent):
+        boost_E_E = {
+            (4, 23): 2.0, (23, 56): 1.8, (23, 23): 1.2,
+            (56, 56): 1.2, (4, 56): 0.6, (56, 23): 0.5, (4, 4): 0.5,
+        }
+
+        for pre in self.neurons:
+            is_exc_pre = pre in self.excitatory
+            pre_layer = getattr(pre, 'layer', 0)
+            pre_int = getattr(pre, 'cell_type', '') if not is_exc_pre else ''
+
+            for post in self.neurons:
+                if pre is post:
+                    continue
+                is_exc_post = post in self.excitatory
+                post_layer = getattr(post, 'layer', 0)
+                post_int = getattr(post, 'cell_type', '') if not is_exc_post else ''
+
+                if   is_exc_pre and is_exc_post:   prob = p * 0.80
+                elif is_exc_pre and not is_exc_post: prob = p * 2.0
+                elif not is_exc_pre and is_exc_post: prob = p * 1.50
+                else:                                prob = p * 0.15
+
+                if is_exc_pre and is_exc_post:
+                    key = (pre_layer, post_layer)
+                    if key in boost_E_E:
+                        prob *= boost_E_E[key]
+
+                if not is_exc_pre and is_exc_post:
+                    if pre_int == "PV":
+                        prob = p * 2.0
+                    elif pre_int == "SST":
+                        prob = p * 1.2
+                    elif pre_int == "VIP":
+                        prob = p * 0.4
+                elif not is_exc_pre and not is_exc_post:
+                    if pre_int == "PV":
+                        prob = p * 0.2
+                    elif pre_int == "SST":
+                        if post_int == "VIP":
+                            prob = p * 2.0
+                        else:
+                            prob = p * 0.3
+                    elif pre_int == "VIP":
+                        if post_int == "SST":
+                            prob = p * 1.8
+                        else:
+                            prob = p * 0.2
+
+                if recurrent and is_exc_pre and is_exc_post:
+                    prob = min(prob * 1.5, 0.90)
+
+                if np.random.random() < prob:
+                    syn_type = "excitatory" if is_exc_pre else "inhibitory"
+                    if syn_type == "excitatory":
+                        w = np.random.uniform(0.50, 0.70)
+                    elif is_exc_post:
+                        w = np.random.uniform(0.60, 0.90)
+                    else:
+                        w = np.random.uniform(0.10, 0.25)
+                    delay = gamma_delay((1, 4))
+                    self.internal_synapses.append(
+                        Synapse(pre, post, weight=w,
+                                synapse_type=syn_type, delay=delay,
+                                use_stp=(syn_type == "excitatory")))
+
+        if len(self.excitatory) > 1 and len(self.input_neurons) > 0:
+            for post in self.excitatory:
+                if post in self.input_neurons:
+                    continue
+                if not any(s.pre in self.input_neurons and s.post is post
+                           and s.synapse_type == "excitatory"
+                           for s in self.internal_synapses):
+                    candidates = list(self.input_neurons)
+                    np.random.shuffle(candidates)
+                    for inp in candidates[:2]:
+                        delay = gamma_delay((1, 4))
+                        self.internal_synapses.append(
+                            Synapse(inp, post,
+                                    weight=np.random.uniform(0.55, 0.75),
+                                    synapse_type="excitatory", delay=delay,
+                                    use_stp=False))
+
+    def stimulate(self, I, target="input"):
+        pool = self.input_neurons if target == "input" else self.excitatory
+        for n in pool:
+            n.receive(I)
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="excitatory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        e_sp = sum(n.firing_rate for n in self.excitatory)
+        i_sp = sum(n.firing_rate for n in self.inhibitory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.excitatory)}E + {len(self.inhibitory)}I"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  E spikes: {e_sp}   I spikes: {i_sp}")
+        for n in self.neurons:
+            kind = "E" if n in self.excitatory else "I"
+            int_str = f" {n.cell_type}" if kind == "I" else ""
+            layer_str = f"L{getattr(n, 'layer', '')} " if kind == "E" else "    "
+            tag  = (" ←in " if n in self.input_neurons else
+                    " →out" if n in self.output_neurons else "     ")
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[{kind}{int_str}] {layer_str}{tag}  {n.firing_rate:3d}  |{bar}")
+
+# ======================================================================
+#  Thalamus – V16 (unchanged from V15)
+# ======================================================================
+class Thalamus(BrainRegion):
+    def __init__(self, name="Thalamus", n_relay=4, n_trn=2,
+                 p_connect=0.20, noise_std=0.010, target_rate_i=25.0,
+                 biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+
+        self.excitatory = [BrainNeuron(tau_m=15.0, threshold=0.50,
+                           noise_std=noise_std, refractory=3,
+                           target_rate=15.0,
+                           adapt_gain=0.003, adapt_tau=250.0,
+                           layer=0, cell_type="excitatory",
+                           has_t_current=True, biophysical=biophysical)
+                   for _ in range(n_relay)]
+        self.inhibitory = [BrainNeuron(tau_m=8.0, threshold=0.38,
+                           noise_std=noise_std, refractory=2,
+                           target_rate=target_rate_i,
+                           adapt_gain=0.008, adapt_tau=120.0,
+                           layer=0, cell_type="TRN", biophysical=biophysical)
+                   for _ in range(n_trn)]
+        self.neurons = self.excitatory + self.inhibitory
+        self.input_neurons  = self.excitatory
+        self.output_neurons = self.excitatory
+
+        self._wire_thalamus(p_connect)
+
+    def _wire_thalamus(self, p):
+        for pre in self.neurons:
+            is_tc = pre in self.excitatory
+            for post in self.neurons:
+                if pre is post:
+                    continue
+                is_tc_post = post in self.excitatory
+
+                if   is_tc and not is_tc_post:    prob = p * 0.60   # V15: reduced TC→TRN
+                elif not is_tc and is_tc_post:    prob = p * 1.60
+                elif not is_tc and not is_tc_post: prob = p * 0.10
+                else:                              prob = 0.0
+
+                if prob > 0 and np.random.random() < prob:
+                    syn_type = "excitatory" if is_tc else "inhibitory"
+                    if syn_type == "excitatory":
+                        w = np.random.uniform(0.40, 0.55)
+                    else:
+                        w = np.random.uniform(0.50, 0.80)
+                    delay = gamma_delay((1, 3))
+                    self.internal_synapses.append(
+                        Synapse(pre, post, weight=w,
+                                synapse_type=syn_type, delay=delay,
+                                use_stp=False))
+
+    def receive_input(self, I):
+        for n in self.excitatory:
+            n.receive(I)
+
+# ======================================================================
+#  BASAL GANGLIA REGIONS (same as V15)
+# ======================================================================
+
+class StriatumD1(BrainRegion):
+    def __init__(self, name="Striatum D1", n_neurons=8, p_connect=0.20,
+                 noise_std=0.010, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.excitatory = []
+        self.inhibitory = [BrainNeuron(tau_m=18.0, threshold=0.50,
+                           noise_std=noise_std, refractory=4,
+                           target_rate=10.0,
+                           adapt_gain=0.015, adapt_tau=180.0,
+                           layer=0, cell_type="D1_MSN", biophysical=biophysical)
+                   for _ in range(n_neurons)]
+        self.neurons = self.inhibitory
+        self.input_neurons  = self.inhibitory
+        self.output_neurons = self.inhibitory
+        self._wire_striatum(p_connect)
+
+    def _wire_striatum(self, p):
+        for pre in self.neurons:
+            for post in self.neurons:
+                if pre is post:
+                    continue
+                if np.random.random() < p * 0.10:
+                    w = np.random.uniform(0.05, 0.15)
+                    delay = gamma_delay((1, 3))
+                    self.internal_synapses.append(
+                        Synapse(pre, post, weight=w,
+                                synapse_type="inhibitory", delay=delay,
+                                use_stp=False))
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="inhibitory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        i_sp = sum(n.firing_rate for n in self.inhibitory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.inhibitory)} MSNs (GABA)"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  I spikes: {i_sp}")
+        for n in self.neurons:
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[I {n.cell_type}]       {n.firing_rate:3d}  |{bar}")
+
+
+class StriatumD2(BrainRegion):
+    def __init__(self, name="Striatum D2", n_neurons=8, p_connect=0.20,
+                 noise_std=0.010, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.excitatory = []
+        self.inhibitory = [BrainNeuron(tau_m=18.0, threshold=0.50,
+                           noise_std=noise_std, refractory=4,
+                           target_rate=10.0,
+                           adapt_gain=0.015, adapt_tau=180.0,
+                           layer=0, cell_type="D2_MSN", biophysical=biophysical)
+                   for _ in range(n_neurons)]
+        self.neurons = self.inhibitory
+        self.input_neurons  = self.inhibitory
+        self.output_neurons = self.inhibitory
+        self._wire_striatum(p_connect)
+
+    def _wire_striatum(self, p):
+        for pre in self.neurons:
+            for post in self.neurons:
+                if pre is post:
+                    continue
+                if np.random.random() < p * 0.10:
+                    w = np.random.uniform(0.05, 0.15)
+                    delay = gamma_delay((1, 3))
+                    self.internal_synapses.append(
+                        Synapse(pre, post, weight=w,
+                                synapse_type="inhibitory", delay=delay,
+                                use_stp=False))
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="inhibitory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        i_sp = sum(n.firing_rate for n in self.inhibitory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.inhibitory)} MSNs (GABA)"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  I spikes: {i_sp}")
+        for n in self.neurons:
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[I {n.cell_type}]       {n.firing_rate:3d}  |{bar}")
+
+
+class GPe(BrainRegion):
+    def __init__(self, name="GPe", n_neurons=4, p_connect=0.25, noise_std=0.010, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.excitatory = []
+        self.inhibitory = [BrainNeuron(tau_m=10.0, threshold=0.30,
+                           noise_std=noise_std, refractory=2,
+                           target_rate=30.0,
+                           adapt_gain=0.005, adapt_tau=100.0,
+                           layer=0, cell_type="GPe", biophysical=biophysical)
+                   for _ in range(n_neurons)]
+        self.neurons = self.inhibitory
+        self.input_neurons  = self.inhibitory
+        self.output_neurons = self.inhibitory
+        self._wire_gpe(p_connect)
+
+    def _wire_gpe(self, p):
+        for pre in self.neurons:
+            for post in self.neurons:
+                if pre is post:
+                    continue
+                if np.random.random() < p * 0.30:
+                    w = np.random.uniform(0.20, 0.40)
+                    delay = gamma_delay((1, 3))
+                    self.internal_synapses.append(
+                        Synapse(pre, post, weight=w,
+                                synapse_type="inhibitory", delay=delay,
+                                use_stp=False))
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="inhibitory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        i_sp = sum(n.firing_rate for n in self.inhibitory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.inhibitory)} cells (GABA)"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  I spikes: {i_sp}")
+        for n in self.neurons:
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[I {n.cell_type}]        {n.firing_rate:3d}  |{bar}")
+
+
+class GPi(BrainRegion):
+    def __init__(self, name="GPi", n_neurons=4, p_connect=0.25, noise_std=0.010, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.excitatory = []
+        self.inhibitory = [BrainNeuron(tau_m=10.0, threshold=0.35,
+                           noise_std=noise_std, refractory=2,
+                           target_rate=25.0,
+                           adapt_gain=0.005, adapt_tau=100.0,
+                           layer=0, cell_type="GPi", biophysical=biophysical)
+                   for _ in range(n_neurons)]
+        self.neurons = self.inhibitory
+        self.input_neurons  = self.inhibitory
+        self.output_neurons = self.inhibitory
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="inhibitory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        i_sp = sum(n.firing_rate for n in self.inhibitory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.inhibitory)} cells (GABA)"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  I spikes: {i_sp}")
+        for n in self.neurons:
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[I {n.cell_type}]        {n.firing_rate:3d}  |{bar}")
+
+
+class STN(BrainRegion):
+    def __init__(self, name="STN", n_neurons=4, p_connect=0.15, noise_std=0.010, biophysical=False):
+        self.name              = name
+        self.internal_synapses = []
+        self.excitatory = [BrainNeuron(tau_m=12.0, threshold=0.40,
+                           noise_std=noise_std, refractory=3,
+                           target_rate=20.0,
+                           adapt_gain=0.008, adapt_tau=120.0,
+                           layer=0, cell_type="STN", biophysical=biophysical)
+                   for _ in range(n_neurons)]
+        self.inhibitory = []
+        self.neurons = self.excitatory
+        self.input_neurons  = self.excitatory
+        self.output_neurons = self.excitatory
+
+    def project_to(self, other, n_connections, weight_range,
+                   delay_range, learn_rate, target="input",
+                   dopamine_receptor=None):
+        post_pool = (other.input_neurons if target == "input"
+                     else other.inhibitory)
+        synapses = []
+        for _ in range(n_connections):
+            pre   = np.random.choice(self.output_neurons)
+            post  = np.random.choice(post_pool)
+            w     = np.random.uniform(*weight_range)
+            delay = gamma_delay(delay_range)
+            synapses.append(Synapse(pre, post, weight=w,
+                                    synapse_type="excitatory",
+                                    delay=delay, learn_rate=learn_rate,
+                                    use_stp=False,
+                                    dopamine_receptor=dopamine_receptor))
+        return synapses
+
+    def stats(self):
+        e_sp = sum(n.firing_rate for n in self.excitatory)
+        avg_fatigue = np.mean([n.fatigue for n in self.neurons])
+        print(f"\n  [{self.name}]  {len(self.excitatory)} cells (GLU)"
+              f"  |  {len(self.internal_synapses)} internal synapses"
+              f"  |  avg fatigue = {avg_fatigue:.3f}")
+        print(f"  E spikes: {e_sp}")
+        for n in self.neurons:
+            bar  = "█" * min(n.firing_rate, 40)
+            print(f"    {n}[E {n.cell_type}]        {n.firing_rate:3d}  |{bar}")
+
+# ======================================================================
+#  Brain – V16: adds serotonin (5‑HT)
+# ======================================================================
+class Brain:
+    def __init__(self):
+        self.regions         = []
+        self._all_neurons    = []
+        self._all_synapses   = []
+        self._projection_map = []
+        self._thalamus       = None
+
+        self.sleep_pressure   = 0.0
+        self.sleep_threshold  = 1.0
+        self.wake_threshold   = 0.2
+        self.buildup_rate     = 0.00003
+        self.passive_recovery = 0.00005
+        self.state            = "wake"
+        self.last_replay      = -1000
+
+        self.dopamine         = 0.0
+        self.dopamine_tau     = 200.0
+
+        self.acetylcholine    = 1.0
+        self.norepinephrine   = 1.0
+        self.ach_tau          = 500.0
+        self.ne_tau           = 200.0
+
+        # Serotonin (V16)
+        self.serotonin        = 0.5   # tonic level
+        self.serotonin_tau    = 1000.0  # slow decay
+
+    def add_region(self, region):
+        self.regions.append(region)
+        self._all_neurons.extend(region.neurons)
+        self._all_synapses.extend(region.internal_synapses)
+        if isinstance(region, Thalamus):
+            self._thalamus = region
+        return region
+
+    def connect(self, pre_region, post_region,
+                projection_type="feedforward", n_connections=4, target="input",
+                dopamine_receptor=None):
+        preset   = PROJECTION[projection_type]
+        synapses = pre_region.project_to(
+            post_region,
+            n_connections = n_connections,
+            weight_range  = preset["weight_range"],
+            delay_range   = preset["delay_range"],
+            learn_rate    = preset["learn_rate"],
+            target        = target,
+            dopamine_receptor = dopamine_receptor,
+        )
+        self._all_synapses.extend(synapses)
+        self._projection_map.append((pre_region, post_region, projection_type, synapses))
+        return synapses
+
+    def present(self, I):
+        if self._thalamus is not None:
+            self._thalamus.receive_input(I * (1.0 + 0.2 * self.acetylcholine))
+        else:
+            raise RuntimeError("No Thalamus region added.")
+
+    def step(self, t, dt=1.0):
+        for syn in self._all_synapses:
+            syn.deliver()
+        for syn in self._all_synapses:
+            syn.step(dt)
+
+        if self.state == "sleep" and t - self.last_replay >= 200:
+            for region in self.regions:
+                if "Hippocampus" in region.name:
+                    for n in region.input_neurons:
+                        n.receive(0.25)
+            self.last_replay = t
+
+        self.dopamine *= np.exp(-dt / self.dopamine_tau)
+        if t > 0 and t % 2000 == 0 and self.state == "wake":
+            self.dopamine = 1.0
+
+        target_ach = 1.0 if self.state == "wake" else 0.0
+        target_ne  = 1.0 if self.state == "wake" else 0.0
+        target_5ht = 0.5 if self.state == "wake" else 0.0   # serotonin drops during sleep
+        self.acetylcholine  += dt * (target_ach - self.acetylcholine) / self.ach_tau
+        self.norepinephrine += dt * (target_ne  - self.norepinephrine) / self.ne_tau
+        self.serotonin      += dt * (target_5ht - self.serotonin) / self.serotonin_tau
+
+        fired = set()
+        for neuron in self._all_neurons:
+            if neuron.step(t, dt, norepinephrine=self.norepinephrine, serotonin=self.serotonin):
+                fired.add(neuron)
+
+        for syn in self._all_synapses:
+            syn.enqueue(syn.pre in fired)
+
+        for syn in self._all_synapses:
+            if syn.post in fired:
+                syn.stdp_update(t, dopamine=self.dopamine,
+                                acetylcholine=self.acetylcholine)
+
+        if t > 0 and t % 50 == 0:
+            for neuron in self._all_neurons:
+                neuron.homeostatic_step(window_ms=50)
+
+        recovery_rate = (0.005 if self.state == "sleep" else 0.0005)
+        for neuron in self._all_neurons:
+            neuron.fatigue = max(0.0, neuron.fatigue - recovery_rate * dt)
+
+        total_spikes = len(fired)
+        self.sleep_pressure += total_spikes * self.buildup_rate - self.passive_recovery * dt
+        self.sleep_pressure = max(0.0, self.sleep_pressure)
+
+        if self.state == "wake" and self.sleep_pressure > self.sleep_threshold:
+            self.state = "sleep"
+            print(f"  >>> t={t}: entering SLEEP state (pressure={self.sleep_pressure:.3f})")
+        elif self.state == "sleep" and self.sleep_pressure < self.wake_threshold:
+            self.state = "wake"
+            print(f"  >>> t={t}: waking up (pressure={self.sleep_pressure:.3f})")
+
+        return fired
+
+    def stats(self):
+        total = sum(n.firing_rate for n in self._all_neurons)
+        print(f"\n{'═'*56}")
+        print(f"  BRAIN  |  {len(self._all_neurons)} neurons  "
+              f"{len(self._all_synapses)} synapses  "
+              f"{len(self.regions)} regions  "
+              f"{total} total spikes  "
+              f"state={self.state}  pressure={self.sleep_pressure:.3f}"
+              f"  DA={self.dopamine:.3f} ACh={self.acetylcholine:.3f} NE={self.norepinephrine:.3f} 5HT={self.serotonin:.3f}")
+        print(f"{'═'*56}")
+        for region in self.regions:
+            region.stats()
+        print(f"\n  Inter-region projections:")
+        for pre, post, ptype, syns in self._projection_map:
+            avg_w = np.mean([s.weight for s in syns])
+            print(f"    {pre.name:14s} → {post.name:14s}  "
+                  f"[{ptype:11s}]  {len(syns)} axons  avg_w={avg_w:.3f}")
+        print(f"{'═'*56}\n")
+
+
+# -------------------------
+# Fast (Numba-capable) core
+# -------------------------
+def _prepare_numba_arrays(brain):
+    neurons = list(brain._all_neurons)
+    N = len(neurons)
+    idx = {n: i for i, n in enumerate(neurons)}
+
+    v = np.zeros(N, dtype=np.float64)
+    v_reset = np.zeros(N, dtype=np.float64)
+    base_threshold = np.zeros(N, dtype=np.float64)
+    tau_m = np.zeros(N, dtype=np.float64)
+    pending_I = np.zeros(N, dtype=np.float64)
+    g_ampa = np.zeros(N, dtype=np.float64)
+    g_gaba = np.zeros(N, dtype=np.float64)
+    g_ahp = np.zeros(N, dtype=np.float64)
+    tau_ampa = np.zeros(N, dtype=np.float64)
+    tau_gaba = np.zeros(N, dtype=np.float64)
+    eta = np.zeros(N, dtype=np.float64)
+    tau_noise = np.zeros(N, dtype=np.float64)
+    noise_std = np.zeros(N, dtype=np.float64)
+    last_spike = np.full(N, -1000.0, dtype=np.float64)
+    refractory = np.zeros(N, dtype=np.float64)
+    has_t_current = np.zeros(N, dtype=np.int32)
+    I_burst = np.zeros(N, dtype=np.float64)
+    adapt_gain = np.zeros(N, dtype=np.float64)
+    adapt_tau = np.zeros(N, dtype=np.float64)
+    fatigue = np.zeros(N, dtype=np.float64)
+    _scale = np.ones(N, dtype=np.float64)
+    d2_mask = np.zeros(N, dtype=np.int32)
+    biophysical = np.zeros(N, dtype=np.int32)
+    Cm = np.ones(N, dtype=np.float64)
+    g_leak = np.ones(N, dtype=np.float64)
+    E_leak = np.zeros(N, dtype=np.float64)
+    E_exc = np.zeros(N, dtype=np.float64)
+    E_inh = np.zeros(N, dtype=np.float64)
+    E_ahp = np.zeros(N, dtype=np.float64)
+
+    for i, n in enumerate(neurons):
+        v[i] = n.v
+        v_reset[i] = n.v_reset
+        base_threshold[i] = n.base_threshold
+        tau_m[i] = n.tau_m
+        pending_I[i] = n._pending_I
+        g_ampa[i] = n.g_ampa
+        g_gaba[i] = n.g_gaba
+        g_ahp[i] = n.g_ahp
+        eta[i] = n.eta
+        tau_noise[i] = getattr(n, 'tau_noise', 5.0)
+        noise_std[i] = n.noise_std
+        last_spike[i] = n.last_spike_time
+        refractory[i] = n.refractory
+        has_t_current[i] = 1 if n.has_t_current else 0
+        I_burst[i] = getattr(n, 'I_burst', 0.0)
+        adapt_gain[i] = n.adapt_gain
+        adapt_tau[i] = n.adapt_tau
+        tau_ampa[i] = n.tau_ampa
+        tau_gaba[i] = n.tau_gaba
+        fatigue[i] = n.fatigue
+        _scale[i] = n._scale
+        d2_mask[i] = 1 if getattr(n, 'cell_type', '') == 'D2_MSN' else 0
+        if getattr(n, 'biophysical', False):
+            biophysical[i] = 1
+            Cm[i] = getattr(n, 'Cm', 200.0)
+            g_leak[i] = getattr(n, 'g_leak', Cm[i] / n.tau_m)
+            E_leak[i] = getattr(n, 'E_leak', n.v_reset)
+            E_exc[i] = getattr(n, 'E_exc', 0.0)
+            E_inh[i] = getattr(n, 'E_inh', -75.0)
+            E_ahp[i] = getattr(n, 'E_ahp', -90.0)
+        else:
+            biophysical[i] = 0
+            E_exc[i] = n.E_exc
+            E_inh[i] = n.E_inh
+            E_ahp[i] = getattr(n, 'E_ahp', -90.0)
+
+    # build outgoing synapse map
+    syns = list(brain._all_synapses)
+    S = len(syns)
+    pre_idx = np.zeros(S, dtype=np.int32)
+    post_idx = np.zeros(S, dtype=np.int32)
+    for j, s in enumerate(syns):
+        pre_idx[j] = idx[s.pre]
+        post_idx[j] = idx[s.post]
+
+    outgoing = [[] for _ in range(N)]
+    for j in range(S):
+        outgoing[int(pre_idx[j])].append(syns[j])
+
+    arrays = dict(
+        v=v, v_reset=v_reset, base_threshold=base_threshold,
+        tau_m=tau_m, pending_I=pending_I, g_ampa=g_ampa, g_gaba=g_gaba,
+        g_ahp=g_ahp, eta=eta, tau_noise=tau_noise, noise_std=noise_std,
+        last_spike=last_spike, refractory=refractory, has_t_current=has_t_current,
+        I_burst=I_burst, adapt_gain=adapt_gain, adapt_tau=adapt_tau,
+        fatigue=fatigue, _scale=_scale, d2_mask=d2_mask,
+        biophysical=biophysical, Cm=Cm, g_leak=g_leak, E_leak=E_leak,
+        E_exc=E_exc, E_inh=E_inh, E_ahp=E_ahp,
+        pre_idx=pre_idx, post_idx=post_idx,
+    )
+    arrays['tau_ampa'] = tau_ampa
+    arrays['tau_gaba'] = tau_gaba
+    return neurons, syns, arrays, outgoing
+
+
+def _prepare_synapse_arrays(brain, neurons):
+    """Convert brain._all_synapses into vectorized arrays and a ring buffer.
+    Returns (syns, syn_arrays, buffer) where syns is the original list of
+    Synapse objects (order matches arrays), syn_arrays is a dict of per-synapse
+    arrays, and buffer is an array of shape (max_delay, S) for scheduled g_inc.
+    """
+    syns = list(brain._all_synapses)
+    S = len(syns)
+    idx = {n: i for i, n in enumerate(neurons)}
+
+    if S == 0:
+        syn_arrays = dict(pre_idx=np.zeros(0, dtype=np.int32),
+                          post_idx=np.zeros(0, dtype=np.int32),
+                          weight=np.zeros(0, dtype=np.float64),
+                          syn_type=np.zeros(0, dtype=np.int8),
+                          delay=np.zeros(0, dtype=np.int32),
+                          use_stp=np.zeros(0, dtype=np.int8),
+                          U=np.zeros(0, dtype=np.float64),
+                          tau_facil=np.zeros(0, dtype=np.float64),
+                          tau_rec=np.zeros(0, dtype=np.float64),
+                          u=np.zeros(0, dtype=np.float64),
+                          R=np.zeros(0, dtype=np.float64),
+                          learn_rate=np.zeros(0, dtype=np.float64),
+                          tau_ltp=np.zeros(0, dtype=np.float64),
+                          tau_ltd=np.zeros(0, dtype=np.float64),
+                          ltd_factor=np.zeros(0, dtype=np.float64),
+                          dopamine_receptor=np.zeros(0, dtype=np.int8),
+                          S=0, max_delay=1)
+        buffer = np.zeros((1, 0), dtype=np.float64)
+        return syns, syn_arrays, buffer
+
+    pre_idx = np.zeros(S, dtype=np.int32)
+    post_idx = np.zeros(S, dtype=np.int32)
+    weight = np.zeros(S, dtype=np.float64)
+    syn_type = np.zeros(S, dtype=np.int8)
+    delay = np.zeros(S, dtype=np.int32)
+    use_stp = np.zeros(S, dtype=np.int8)
+    U = np.zeros(S, dtype=np.float64)
+    tau_facil = np.zeros(S, dtype=np.float64)
+    tau_rec = np.zeros(S, dtype=np.float64)
+    u = np.zeros(S, dtype=np.float64)
+    R = np.ones(S, dtype=np.float64)
+
+    for j, s in enumerate(syns):
+        pre_idx[j] = idx.get(s.pre, -1)
+        post_idx[j] = idx.get(s.post, -1)
+        weight[j] = float(getattr(s, 'weight', 0.0))
+        syn_type[j] = 1 if getattr(s, 'synapse_type', 'excitatory') == 'excitatory' else -1
+        delay[j] = int(getattr(s, 'delay', 1))
+        use_stp[j] = 1 if getattr(s, 'use_stp', False) else 0
+        U[j] = float(getattr(s, 'U', 0.5))
+        tau_facil[j] = float(getattr(s, 'tau_facil', 50.0))
+        tau_rec[j] = float(getattr(s, 'tau_rec', 200.0))
+        u[j] = float(getattr(s, 'u', U[j]))
+        R[j] = float(getattr(s, 'R', 1.0))
+        # STDP / learning parameters
+        learn_rate_arr = float(getattr(s, 'learn_rate', 0.01))
+        tau_ltp_arr = float(getattr(s, 'tau_ltp', 17.0))
+        tau_ltd_arr = float(getattr(s, 'tau_ltd', 34.0))
+        ltd_factor_arr = float(getattr(s, 'ltd_factor', 0.65))
+        dr = getattr(s, 'dopamine_receptor', None)
+        if dr == 'D1':
+            dr_code = 1
+        elif dr == 'D2':
+            dr_code = 2
+        else:
+            dr_code = 0
+        # store into per-syn arrays
+        # lazy initialization for these arrays (create above the loop)
+        try:
+            learn_rate[j] = learn_rate_arr
+            tau_ltp[j] = tau_ltp_arr
+            tau_ltd[j] = tau_ltd_arr
+            ltd_factor[j] = ltd_factor_arr
+            dopamine_receptor[j] = dr_code
+        except Exception:
+            # first-time creation: do nothing here (we populate after loop)
+            pass
+
+    max_delay = int(max(1, int(np.max(delay))))
+    buffer = np.zeros((max_delay, S), dtype=np.float64)
+
+    # Convert Synapse._buffer deques into buffer rows: leftmost (popleft) -> buffer[0]
+    for j, s in enumerate(syns):
+        try:
+            dlist = list(s._buffer)
+        except Exception:
+            dlist = []
+        for k, item in enumerate(dlist):
+            if k >= max_delay:
+                break
+            g_inc, stype = item
+            if g_inc != 0.0 and stype is not None:
+                buffer[k, j] = float(g_inc)
+
+    # create learning/STDP arrays (fill with defaults then overwrite where available)
+    learn_rate = np.zeros(S, dtype=np.float64)
+    tau_ltp = np.zeros(S, dtype=np.float64)
+    tau_ltd = np.zeros(S, dtype=np.float64)
+    ltd_factor = np.zeros(S, dtype=np.float64)
+    dopamine_receptor = np.zeros(S, dtype=np.int8)
+
+    for j, s in enumerate(syns):
+        learn_rate[j] = float(getattr(s, 'learn_rate', 0.01))
+        tau_ltp[j] = float(getattr(s, 'tau_ltp', 17.0))
+        tau_ltd[j] = float(getattr(s, 'tau_ltd', 34.0))
+        ltd_factor[j] = float(getattr(s, 'ltd_factor', 0.65))
+        dr = getattr(s, 'dopamine_receptor', None)
+        if dr == 'D1':
+            dopamine_receptor[j] = 1
+        elif dr == 'D2':
+            dopamine_receptor[j] = 2
+        else:
+            dopamine_receptor[j] = 0
+
+    syn_arrays = dict(pre_idx=pre_idx, post_idx=post_idx, weight=weight,
+                      syn_type=syn_type, delay=delay, use_stp=use_stp,
+                      U=U, tau_facil=tau_facil, tau_rec=tau_rec,
+                      u=u, R=R,
+                      learn_rate=learn_rate, tau_ltp=tau_ltp, tau_ltd=tau_ltd,
+                      ltd_factor=ltd_factor, dopamine_receptor=dopamine_receptor,
+                      S=S, max_delay=max_delay)
+    return syns, syn_arrays, buffer
+
+
+def _numba_step_available():
+    return NUMBA_AVAILABLE
+
+if NUMBA_AVAILABLE:
+    @njit
+    def _numba_step(v, v_reset, base_threshold, tau_m, pending_I, g_ampa, g_gaba, g_ahp,
+                    eta, tau_noise, noise_std, last_spike, refractory, has_t_current,
+                    I_burst, adapt_gain, adapt_tau, fatigue, _scale, d2_mask,
+                    biophysical, Cm, g_leak, E_leak, E_exc, E_inh, E_ahp,
+                    tau_ampa, tau_gaba,
+                    dt, norepinephrine, serotonin, noise_sample, t):
+        N = v.shape[0]
+        fired = np.zeros(N, dtype=np.int32)
+        for i in range(N):
+            # OU noise
+            eta[i] += dt * (-eta[i] / tau_noise[i]) + math.sqrt(max(1e-12, 2 * dt / tau_noise[i])) * noise_std[i] * noise_sample[i]
+            # decay synaptic/adaptation conductances
+            g_ahp[i] += dt * (-g_ahp[i] / adapt_tau[i])
+            g_ampa[i] += dt * (-g_ampa[i] / tau_ampa[i])
+            g_gaba[i] += dt * (-g_gaba[i] / tau_gaba[i])
+
+            if t - last_spike[i] < refractory[i]:
+                pending_I[i] = 0.0
+                continue
+
+            effective_threshold = base_threshold[i] + fatigue[i]
+
+            if biophysical[i] == 0:
+                I_ampa = g_ampa[i] * (E_exc[i] - v[i]) * _scale[i]
+                I_gaba = g_gaba[i] * (E_inh[i] - v[i])
+                I_b = I_burst[i] if has_t_current[i] == 1 else 0.0
+                effective_I = pending_I[i] + I_ampa + I_gaba - g_ahp[i] + eta[i] + I_b
+                effective_I *= (1.0 + 0.05 * norepinephrine)
+                if d2_mask[i] == 1:
+                    effective_I *= (1.0 + 0.3 * serotonin)
+                v[i] += dt * (-v[i] / tau_m[i] + effective_I)
+                if v[i] < v_reset[i]:
+                    v[i] = v_reset[i]
+            else:
+                # biophysical mode
+                I_leak = g_leak[i] * (E_leak[i] - v[i])
+                I_ampa = g_ampa[i] * (E_exc[i] - v[i]) * _scale[i]
+                I_gaba = g_gaba[i] * (E_inh[i] - v[i])
+                I_ahp = g_ahp[i] * (E_ahp[i] - v[i])
+                I_b = I_burst[i] if has_t_current[i] == 1 else 0.0
+                I_total = I_leak + I_ampa + I_gaba + I_ahp + I_b + eta[i] + pending_I[i]
+                I_total *= (1.0 + 0.05 * norepinephrine)
+                if d2_mask[i] == 1:
+                    I_total *= (1.0 + 0.3 * serotonin)
+                v[i] += dt * (I_total / Cm[i])
+                if v[i] < v_reset[i]:
+                    v[i] = v_reset[i]
+
+            # spike condition
+            if v[i] >= effective_threshold:
+                fired[i] = 1
+                last_spike[i] = t
+                v[i] = v_reset[i]
+                g_ahp[i] += adapt_gain[i]
+                fatigue[i] = min(fatigue[i] + 0.035, 0.3)
+                pending_I[i] = 0.0
+            else:
+                fired[i] = 0
+        return fired
+else:
+    def _numba_step(v, v_reset, base_threshold, tau_m, pending_I, g_ampa, g_gaba, g_ahp,
+                    eta, tau_noise, noise_std, last_spike, refractory, has_t_current,
+                    I_burst, adapt_gain, adapt_tau, fatigue, _scale, d2_mask,
+                    biophysical, Cm, g_leak, E_leak, E_exc, E_inh, E_ahp,
+                    tau_ampa, tau_gaba,
+                    dt, norepinephrine, serotonin, noise_sample, t):
+        # pure-Python fallback using NumPy operations
+        N = v.shape[0]
+        fired = np.zeros(N, dtype=np.int32)
+        for i in range(N):
+            eta[i] += dt * (-eta[i] / tau_noise[i]) + math.sqrt(max(1e-12, 2 * dt / tau_noise[i])) * noise_std[i] * noise_sample[i]
+            g_ahp[i] += dt * (-g_ahp[i] / adapt_tau[i])
+            g_ampa[i] += dt * (-g_ampa[i] / tau_ampa[i])
+            g_gaba[i] += dt * (-g_gaba[i] / tau_gaba[i])
+            if t - last_spike[i] < refractory[i]:
+                pending_I[i] = 0.0
+                continue
+            effective_threshold = base_threshold[i] + fatigue[i]
+            if biophysical[i] == 0:
+                I_ampa = g_ampa[i] * (E_exc[i] - v[i]) * _scale[i]
+                I_gaba = g_gaba[i] * (E_inh[i] - v[i])
+                I_b = I_burst[i] if has_t_current[i] == 1 else 0.0
+                effective_I = pending_I[i] + I_ampa + I_gaba - g_ahp[i] + eta[i] + I_b
+                effective_I *= (1.0 + 0.05 * norepinephrine)
+                if d2_mask[i] == 1:
+                    effective_I *= (1.0 + 0.3 * serotonin)
+                v[i] += dt * (-v[i] / tau_m[i] + effective_I)
+                if v[i] < v_reset[i]:
+                    v[i] = v_reset[i]
+            else:
+                I_leak = g_leak[i] * (E_leak[i] - v[i])
+                I_ampa = g_ampa[i] * (E_exc[i] - v[i]) * _scale[i]
+                I_gaba = g_gaba[i] * (E_inh[i] - v[i])
+                I_ahp = g_ahp[i] * (E_ahp[i] - v[i])
+                I_b = I_burst[i] if has_t_current[i] == 1 else 0.0
+                I_total = I_leak + I_ampa + I_gaba + I_ahp + I_b + eta[i] + pending_I[i]
+                I_total *= (1.0 + 0.05 * norepinephrine)
+                if d2_mask[i] == 1:
+                    I_total *= (1.0 + 0.3 * serotonin)
+                v[i] += dt * (I_total / Cm[i])
+                if v[i] < v_reset[i]:
+                    v[i] = v_reset[i]
+            if v[i] >= effective_threshold:
+                fired[i] = 1
+                last_spike[i] = t
+                v[i] = v_reset[i]
+                g_ahp[i] += adapt_gain[i]
+                fatigue[i] = min(fatigue[i] + 0.035, 0.3)
+                pending_I[i] = 0.0
+            else:
+                fired[i] = 0
+        return fired
+
+
+def run_fast_simulation(brain, STEPS=1000, dt=1.0, record_history=False):
+    neurons, syn_objs, arrays, outgoing = _prepare_numba_arrays(brain)
+    N = len(neurons)
+
+    v = arrays['v']; v_reset = arrays['v_reset']; base_threshold = arrays['base_threshold']
+    tau_m = arrays['tau_m']; pending_I = arrays['pending_I']; g_ampa = arrays['g_ampa']; g_gaba = arrays['g_gaba']
+    g_ahp = arrays['g_ahp']; eta = arrays['eta']; tau_noise = arrays['tau_noise']; noise_std = arrays['noise_std']
+    last_spike = arrays['last_spike']; refractory = arrays['refractory']; has_t_current = arrays['has_t_current']
+    I_burst = arrays['I_burst']; adapt_gain = arrays['adapt_gain']; adapt_tau = arrays['adapt_tau']
+
+    fatigue = arrays['fatigue']; _scale = arrays['_scale']; d2_mask = arrays['d2_mask']
+    biophysical = arrays['biophysical']; Cm = arrays['Cm']; g_leak = arrays['g_leak']; E_leak = arrays['E_leak']
+    E_exc = arrays['E_exc']; E_inh = arrays['E_inh']; E_ahp = arrays['E_ahp']
+
+    # prepare synapse arrays + ring buffer
+    syns, syn_arrays, syn_buffer = _prepare_synapse_arrays(brain, neurons)
+    S = syn_arrays['S'] if syn_arrays is not None else 0
+    pre_idx = syn_arrays['pre_idx'] if S > 0 else np.zeros(0, dtype=np.int32)
+    post_idx = syn_arrays['post_idx'] if S > 0 else np.zeros(0, dtype=np.int32)
+    weight = syn_arrays['weight'] if S > 0 else np.zeros(0, dtype=np.float64)
+    syn_type = syn_arrays['syn_type'] if S > 0 else np.zeros(0, dtype=np.int8)
+    delay = syn_arrays['delay'] if S > 0 else np.zeros(0, dtype=np.int32)
+    use_stp = syn_arrays['use_stp'] if S > 0 else np.zeros(0, dtype=np.int8)
+    U = syn_arrays['U'] if S > 0 else np.zeros(0, dtype=np.float64)
+    tau_facil = syn_arrays['tau_facil'] if S > 0 else np.zeros(0, dtype=np.float64)
+    tau_rec = syn_arrays['tau_rec'] if S > 0 else np.zeros(0, dtype=np.float64)
+    u = syn_arrays['u'] if S > 0 else np.zeros(0, dtype=np.float64)
+    R = syn_arrays['R'] if S > 0 else np.ones(0, dtype=np.float64)
+    max_delay = syn_arrays['max_delay'] if S > 0 else 1
+    learn_rate = syn_arrays['learn_rate'] if S > 0 else np.zeros(0, dtype=np.float64)
+    tau_ltp = syn_arrays['tau_ltp'] if S > 0 else np.zeros(0, dtype=np.float64)
+    tau_ltd = syn_arrays['tau_ltd'] if S > 0 else np.zeros(0, dtype=np.float64)
+    ltd_factor = syn_arrays['ltd_factor'] if S > 0 else np.zeros(0, dtype=np.float64)
+    dopamine_receptor = syn_arrays['dopamine_receptor'] if S > 0 else np.zeros(0, dtype=np.int8)
+
+    spike_map = {n: [] for n in neurons} if record_history else None
+
+    current_bin = 0
+    buffer_flat = syn_buffer.reshape(-1) if S > 0 else None
+
+    for tstep in range(STEPS):
+        # collect pending external currents from neuron objects into array
+        for i, n in enumerate(neurons):
+            pending_I[i] += n._pending_I
+            n._pending_I = 0.0
+
+        # deliver synaptic events from ring buffer into conductances
+        if S > 0:
+            g_row = syn_buffer[current_bin, :]
+            if g_row.any():
+                exc_mask = syn_type == 1
+                inh_mask = syn_type == -1
+                if exc_mask.any():
+                    idxs = post_idx[exc_mask]
+                    vals = g_row[exc_mask]
+                    if vals.size:
+                        np.add.at(g_ampa, idxs, vals)
+                if inh_mask.any():
+                    idxs = post_idx[inh_mask]
+                    vals = g_row[inh_mask]
+                    if vals.size:
+                        np.add.at(g_gaba, idxs, vals)
+            # clear delivered bin
+            syn_buffer[current_bin, :] = 0.0
+
+        # synapse STP recovery (vectorized)
+        if S > 0 and use_stp.any():
+            stp_mask = use_stp == 1
+            R[stp_mask] += dt * ((1.0 - R[stp_mask]) / tau_rec[stp_mask])
+            u[stp_mask] += dt * (-(u[stp_mask] - U[stp_mask]) / tau_facil[stp_mask])
+            # clamps
+            np.clip(R, 0.0, 1.0, out=R)
+            np.clip(u, 0.0, 1.0, out=u)
+
+        # noise samples
+        noise_sample = np.random.normal(size=N)
+
+        # neuron update (numba-accelerated if available)
+        fired = _numba_step(v, v_reset, base_threshold, tau_m, pending_I, g_ampa, g_gaba, g_ahp,
+                    eta, tau_noise, noise_std, last_spike, refractory, has_t_current,
+                    I_burst, adapt_gain, adapt_tau, fatigue, _scale, d2_mask,
+                    biophysical, Cm, g_leak, E_leak, E_exc, E_inh, E_ahp,
+                    arrays['tau_ampa'], arrays['tau_gaba'],
+                    dt, brain.norepinephrine, brain.serotonin, noise_sample, float(tstep))
+
+        # record spikes and update neuron objects counters
+        fired_idx = np.nonzero(fired)[0]
+        for i in fired_idx:
+            neurons[i].spike_times.append(tstep)
+            neurons[i].last_spike_time = tstep
+            neurons[i]._spike_counter += 1
+
+        # enqueue synapses according to fired presynaptic neurons (vectorized into ring buffer)
+        if S > 0 and fired_idx.size > 0:
+            fired_bool = np.zeros(N, dtype=bool)
+            fired_bool[fired_idx] = True
+            pre_fired_mask = fired_bool[pre_idx]
+            if pre_fired_mask.any():
+                pf_idx = np.nonzero(pre_fired_mask)[0]
+                # prepare g_inc values
+                g_inc = np.zeros(pf_idx.size, dtype=np.float64)
+                pf_syn_type = syn_type[pf_idx]
+                pf_use_stp = use_stp[pf_idx] == 1
+
+                # excitatory with STP
+                mask_exc_stp = (pf_syn_type == 1) & pf_use_stp
+                if mask_exc_stp.any():
+                    sel = pf_idx[mask_exc_stp]
+                    u[sel] = u[sel] + U[sel] * (1.0 - u[sel])
+                    release = u[sel] * R[sel]
+                    R[sel] = np.maximum(0.0, R[sel] - release)
+                    g_inc[mask_exc_stp] = weight[sel] * release
+
+                # excitatory without STP
+                mask_exc_nostp = (pf_syn_type == 1) & (~pf_use_stp)
+                if mask_exc_nostp.any():
+                    sel = pf_idx[mask_exc_nostp]
+                    g_inc[mask_exc_nostp] = weight[sel]
+
+                # inhibitory (no STP semantics generally)
+                mask_inh = (pf_syn_type == -1)
+                if mask_inh.any():
+                    sel = pf_idx[mask_inh]
+                    g_inc[mask_inh] = weight[sel]
+
+                # schedule into ring buffer
+                target_bins = (current_bin + delay[pf_idx]) % max_delay
+                # compute flat indices and add
+                flat_idx = target_bins.astype(np.int64) * S + pf_idx.astype(np.int64)
+                np.add.at(buffer_flat, flat_idx, g_inc)
+
+                # write back updated u/R to syn objects for bookkeeping
+                for local_j, global_j in enumerate(pf_idx):
+                    try:
+                        syns[global_j].u = float(u[global_j])
+                        syns[global_j].R = float(R[global_j])
+                    except Exception:
+                        pass
+
+        # STDP on posts that fired (call object method, then sync weight back into arrays)
+        # Vectorized STDP: update weights for synapses whose post neuron fired
+        if S > 0:
+            post_fired_mask = fired[post_idx]
+            if post_fired_mask.any():
+                j_idx = np.nonzero(post_fired_mask)[0]
+                pre_idx_j = pre_idx[j_idx]
+                # delta_t = t_post - t_pre
+                delta_t = (float(tstep) - last_spike[pre_idx_j])
+                # learning parameters
+                lr = learn_rate[j_idx]
+                tau_ltp_j = tau_ltp[j_idx]
+                tau_ltd_j = tau_ltd[j_idx]
+                ltd_j = ltd_factor[j_idx]
+                # compute dw
+                dw = np.empty_like(delta_t, dtype=np.float64)
+                pos_mask = delta_t > 0
+                if pos_mask.any():
+                    dw[pos_mask] = lr[pos_mask] * np.exp(-delta_t[pos_mask] / tau_ltp_j[pos_mask])
+                neg_mask = ~pos_mask
+                if neg_mask.any():
+                    dw[neg_mask] = -lr[neg_mask] * ltd_j[neg_mask] * np.exp(delta_t[neg_mask] / tau_ltd_j[neg_mask])
+                # modulators
+                dw *= (1.0 + brain.acetylcholine)
+                dr = dopamine_receptor[j_idx]
+                da = brain.dopamine
+                if da != 0.0:
+                    # D1
+                    d1_mask = (dr == 1)
+                    if d1_mask.any():
+                        pos = dw > 0
+                        mask = d1_mask & pos
+                        dw[mask] *= (1.0 + da)
+                        mask = d1_mask & (~pos)
+                        dw[mask] *= (1.0 - 0.5 * da)
+                    # D2
+                    d2_mask = (dr == 2)
+                    if d2_mask.any():
+                        pos = dw > 0
+                        mask = d2_mask & pos
+                        dw[mask] *= (1.0 - da)
+                        mask = d2_mask & (~pos)
+                        dw[mask] *= (1.0 + da)
+                # apply updates and clip
+                weight[j_idx] += dw
+                np.clip(weight, 0.0, 2.0, out=weight)
+                # sync back to syn objects
+                for local_j, global_j in enumerate(j_idx):
+                    try:
+                        syns[global_j].weight = float(weight[global_j])
+                    except Exception:
+                        pass
+
+        # periodic homeostasis / fatigue recovery
+        if tstep > 0 and tstep % 50 == 0:
+            for neuron in neurons:
+                neuron.homeostatic_step(window_ms=50)
+
+        recovery_rate = (0.005 if brain.state == "sleep" else 0.0005)
+        for neuron in neurons:
+            neuron.fatigue = max(0.0, neuron.fatigue - recovery_rate * dt)
+
+        total_spikes = int(np.sum(fired))
+        brain.sleep_pressure += total_spikes * brain.buildup_rate - brain.passive_recovery * dt
+        brain.sleep_pressure = max(0.0, brain.sleep_pressure)
+
+        if brain.state == "wake" and brain.sleep_pressure > brain.sleep_threshold:
+            brain.state = "sleep"
+            print(f"  >>> t={tstep}: entering SLEEP state (pressure={brain.sleep_pressure:.3f})")
+        elif brain.state == "sleep" and brain.sleep_pressure < brain.wake_threshold:
+            brain.state = "wake"
+            print(f"  >>> t={tstep}: waking up (pressure={brain.sleep_pressure:.3f})")
+
+        # advance ring buffer pointer
+        current_bin = (current_bin + 1) % max_delay
+
+    # write back voltages to neuron objects and conductances
+    for i, n in enumerate(neurons):
+        n.v = float(v[i])
+        n.g_ampa = float(g_ampa[i])
+        n.g_gaba = float(g_gaba[i])
+        n.g_ahp = float(g_ahp[i])
+
+    return neurons, syns
+
+
+def test_single_neuron_fI(biophysical=False, durations=1000, dt=1.0):
+    """Simple f-I curve test for a single neuron."""
+    currents = np.linspace(0.0, 2.0, 6)
+    results = []
+    for I in currents:
+        n = BrainNeuron(biophysical=biophysical, noise_std=0.0)
+        spikes = 0
+        for t in range(durations):
+            n.receive(I)
+            if n.step(t, dt):
+                spikes += 1
+        rate = spikes / (durations * dt * 0.001)  # spikes / second
+        results.append((I, rate))
+    print("f-I test (biophysical=%s):" % biophysical)
+    for I, r in results:
+        print(f"  I={I:.3f}  -> {r:.2f} Hz")
+    return results
+
+
+def test_psp_amplitude(biophysical=False, weight=0.5, dt=1.0):
+    """Test PSP amplitude from a single presynaptic spike."""
+    pre = BrainNeuron(biophysical=biophysical, noise_std=0.0)
+    post = BrainNeuron(biophysical=biophysical, noise_std=0.0)
+    syn = Synapse(pre, post, weight=weight, synapse_type='excitatory', delay=1, use_stp=False)
+    # enqueue a single presynaptic spike
+    syn.enqueue(True)
+    # deliver immediately from buffer (simulate one step of delay)
+    g_inc, syn_type = syn._buffer.popleft()
+    if g_inc != 0.0 and syn_type is not None:
+        if syn_type == 'excitatory':
+            post.g_ampa += g_inc
+        else:
+            post.g_gaba += g_inc
+    # run a few steps and record voltage
+    vtrace = []
+    for t in range(50):
+        post.step(t, dt)
+        vtrace.append(post.v)
+    peak = max(vtrace)
+    print(f"PSP peak (biophysical={biophysical}, weight={weight}): {peak}")
+    return vtrace
+
+
+def run_parity_tests(seeds=(42, 43, 44), durations=100, biophysical=False):
+    """Run deterministic parity tests comparing object-path vs array-path.
+    Returns list of failures (empty if OK).
+    """
+    failures = []
+    for seed in seeds:
+        np.random.seed(seed)
+        brain = build_scaled_brain(scale=1, fanout=3, biophysical=biophysical, outgoing_fanout=1)
+        # zero noise for determinism
+        for n in brain._all_neurons:
+            n.noise_std = 0.0
+            n.eta = 0.0
+            n._pending_I = 0.0
+
+        # snapshot
+        neuron_snap = []
+        for n in brain._all_neurons:
+            neuron_snap.append(dict(v=n.v, v_reset=n.v_reset, g_ampa=n.g_ampa, g_gaba=n.g_gaba,
+                                    g_ahp=n.g_ahp, _pending_I=n._pending_I, last_spike_time=n.last_spike_time,
+                                    spike_times=list(n.spike_times), _spike_counter=n._spike_counter,
+                                    fatigue=n.fatigue, _scale=n._scale))
+        syn_snap = []
+        for s in brain._all_synapses:
+            syn_snap.append(dict(weight=s.weight, u=s.u, R=s.R, buffer=list(s._buffer), delay=s.delay))
+
+        # run object simulation
+        for t in range(durations):
+            brain.step(t, dt=1.0)
+        obj_vs = [n.v for n in brain._all_neurons]
+        obj_spike_counts = [len(n.spike_times) for n in brain._all_neurons]
+
+        # restore
+        for n, snap in zip(brain._all_neurons, neuron_snap):
+            n.v = snap['v']; n.v_reset = snap['v_reset']; n.g_ampa = snap['g_ampa']; n.g_gaba = snap['g_gaba'];
+            n.g_ahp = snap['g_ahp']; n._pending_I = snap['_pending_I']; n.last_spike_time = snap['last_spike_time'];
+            n.spike_times = list(snap['spike_times']); n._spike_counter = snap['_spike_counter']; n.fatigue = snap['fatigue'];
+            n._scale = snap['_scale']
+        for s, snap in zip(brain._all_synapses, syn_snap):
+            s.weight = snap['weight']; s.u = snap['u']; s.R = snap['R']; s._buffer = deque(snap['buffer'], maxlen=snap['delay'])
+
+        # run fast simulation
+        neurons2, syns2 = run_fast_simulation(brain, STEPS=durations, dt=1.0, record_history=False)
+        fast_vs = [n.v for n in neurons2]
+        fast_spike_counts = [len(n.spike_times) for n in neurons2]
+
+        # compare
+        diffs = []
+        for i, (ov, fv, osc, fsc) in enumerate(zip(obj_vs, fast_vs, obj_spike_counts, fast_spike_counts)):
+            if abs(ov - fv) > 1e-9 or osc != fsc:
+                diffs.append((i, ov, fv, osc, fsc))
+        if diffs:
+            failures.append(dict(seed=seed, diffs=diffs[:20]))
+    return failures
+
+
+def run_full_test_suite():
+    """Run all validation and parity tests (quick mode). Returns dict of results."""
+    results = {}
+    results['validation'] = None
+    try:
+        run_validation_suite()
+        results['validation'] = 'ok'
+    except Exception as e:
+        results['validation'] = f'error: {e}'
+
+    results['parity_biophysical_false'] = run_parity_tests(seeds=(42, 43), durations=80, biophysical=False)
+    results['parity_biophysical_true'] = run_parity_tests(seeds=(42,), durations=80, biophysical=True)
+
+    # small scale benchmark sanity
+    try:
+        res = scale_and_benchmark(scales=(1, 5), fanout=6, steps=80, biophysical=False)
+        results['benchmark'] = res
+    except Exception as e:
+        results['benchmark'] = f'error: {e}'
+
+    return results
+
+
+def run_validation_suite():
+    print("Running validation suite...")
+    test_single_neuron_fI(biophysical=False)
+    test_single_neuron_fI(biophysical=True)
+    test_psp_amplitude(biophysical=False, weight=0.6)
+    test_psp_amplitude(biophysical=True, weight=2.0)
+
+
+# ----------------------------------------------------------------------
+# Scaling helpers: build larger networks with sparse wiring and benchmark
+# ----------------------------------------------------------------------
+def wire_sparse_region(region, fanout=8):
+    """Create a sparse internal wiring for `region` where each presynaptic
+    neuron connects to `fanout` random postsynaptic targets (no O(N^2) loops).
+    """
+    neurons = region.neurons
+    N = len(neurons)
+    if N <= 1:
+        return
+    for pre in neurons:
+        is_exc_pre = pre in region.excitatory
+        k = min(max(1, int(fanout)), N - 1)
+        posts_pool = [n for n in neurons if n is not pre]
+        if len(posts_pool) == 0:
+            continue
+        k = min(k, len(posts_pool))
+        chosen = list(np.random.choice(posts_pool, size=k, replace=False))
+        for post in chosen:
+            syn_type = "excitatory" if is_exc_pre else "inhibitory"
+            if syn_type == "excitatory":
+                w = np.random.uniform(0.50, 0.70)
+                use_stp = True
+            else:
+                w = np.random.uniform(0.10, 0.25)
+                use_stp = False
+            delay = gamma_delay((1, 4))
+            s = Synapse(pre, post, weight=w, synapse_type=syn_type, delay=delay, use_stp=use_stp)
+            region.internal_synapses.append(s)
+
+
+def build_scaled_brain(scale=1, fanout=8, biophysical=False, outgoing_fanout=2):
+    """Construct a Brain with region sizes multiplied by `scale`.
+    Regions are created with `p_connect=0.0` to avoid expensive O(N^2)
+    wiring in constructors; internal synapses are then created with
+    `wire_sparse_region` (O(N * fanout)).
+    """
+    brain = Brain()
+
+    # scaled region sizes (base -> scaled)
+    thalamus = Thalamus(name="Thalamus",
+                        n_relay=max(1, int(8 * scale)),
+                        n_trn=max(1, int(4 * scale)),
+                        p_connect=0.0, biophysical=biophysical)
+    brain.add_region(thalamus)
+    wire_sparse_region(thalamus, fanout=fanout)
+
+    cortex = BrainRegion(name="Cortex",
+                         n_excitatory=max(1, int(18 * scale)),
+                         n_inhibitory=max(1, int(4 * scale)),
+                         p_connect=0.0, recurrent=False,
+                         interneuron_types=["PV", "PV", "SST", "VIP"],
+                         biophysical=biophysical)
+    brain.add_region(cortex)
+    wire_sparse_region(cortex, fanout=fanout)
+
+    hippocampus = BrainRegion(name="Hippocampus",
+                              n_excitatory=max(1, int(15 * scale)),
+                              n_inhibitory=max(1, int(3 * scale)),
+                              p_connect=0.0, recurrent=True,
+                              interneuron_types=["PV", "SST", "VIP"],
+                              biophysical=biophysical)
+    brain.add_region(hippocampus)
+    wire_sparse_region(hippocampus, fanout=fanout)
+
+    striatum_d1 = StriatumD1(name="Striatum D1", n_neurons=max(1, int(8 * scale)), p_connect=0.0, biophysical=biophysical)
+    brain.add_region(striatum_d1)
+    wire_sparse_region(striatum_d1, fanout=max(1, int(fanout//2)))
+
+    striatum_d2 = StriatumD2(name="Striatum D2", n_neurons=max(1, int(8 * scale)), p_connect=0.0, biophysical=biophysical)
+    brain.add_region(striatum_d2)
+    wire_sparse_region(striatum_d2, fanout=max(1, int(fanout//2)))
+
+    gpe = GPe(name="GPe", n_neurons=max(1, int(4 * scale)), p_connect=0.0, biophysical=biophysical)
+    brain.add_region(gpe)
+    wire_sparse_region(gpe, fanout=max(1, int(fanout//2)))
+
+    gpi = GPi(name="GPi", n_neurons=max(1, int(4 * scale)), p_connect=0.0, biophysical=biophysical)
+    brain.add_region(gpi)
+    wire_sparse_region(gpi, fanout=max(1, int(fanout//2)))
+
+    stn = STN(name="STN", n_neurons=max(1, int(4 * scale)), p_connect=0.0, biophysical=biophysical)
+    brain.add_region(stn)
+    wire_sparse_region(stn, fanout=max(1, int(fanout//2)))
+
+    # Inter-region projections: scale base connection counts but cap by output size * fanout
+    def safe_connect(pre, post, base_n, ptype="feedforward", target="input", dopamine_receptor=None):
+        max_conn = max(1, int(len(pre.output_neurons) * outgoing_fanout))
+        n_conn = min(max_conn, max(1, int(base_n * scale)))
+        brain.connect(pre, post, projection_type=ptype, n_connections=n_conn, target=target, dopamine_receptor=dopamine_receptor)
+
+    safe_connect(thalamus, cortex, 36, ptype="feedforward")
+    safe_connect(cortex, thalamus, 8, ptype="feedback", target="inhibitory")
+    safe_connect(cortex, hippocampus, 30, ptype="feedforward")
+    safe_connect(hippocampus, cortex, 18, ptype="feedback")
+    safe_connect(cortex, striatum_d1, 24, ptype="feedforward", dopamine_receptor='D1')
+    safe_connect(cortex, striatum_d2, 24, ptype="feedforward", dopamine_receptor='D2')
+    safe_connect(cortex, stn, 12, ptype="feedforward")
+    safe_connect(striatum_d1, gpi, 16, ptype="feedforward", target="input")
+    safe_connect(striatum_d2, gpe, 12, ptype="feedforward", target="input")
+    safe_connect(gpe, stn, 8, ptype="feedforward", target="input")
+    safe_connect(stn, gpe, 8, ptype="feedforward", target="input")
+    safe_connect(gpe, gpi, 8, ptype="feedforward", target="input")
+    safe_connect(stn, gpi, 12, ptype="feedforward", target="input")
+    safe_connect(gpi, thalamus, 12, ptype="feedback", target="inhibitory")
+
+    # Ensure any internal synapses created after regions were added are registered
+    for region in brain.regions:
+        for s in getattr(region, "internal_synapses", []):
+            if s not in brain._all_synapses:
+                brain._all_synapses.append(s)
+
+    return brain
+
+
+def validate_connectivity(brain, verbose=True):
+    """Basic connectivity validator and summary for a built `brain`.
+    Prints total neurons/synapses, excitatory/inhibitory split, in/out degree
+    statistics and a region->region connection matrix. Returns a dict of
+    summary arrays for programmatic checks.
+    """
+    import numpy as _np
+
+    neurons = list(brain._all_neurons)
+    N = len(neurons)
+    syns = list(brain._all_synapses)
+    S = len(syns)
+    if verbose:
+        print(f"Connectivity: {N} neurons, {S} synapses, {len(brain.regions)} regions")
+    if N == 0:
+        return {}
+
+    # duplicate-check
+    ids = [id(s) for s in syns]
+    if len(set(ids)) != len(ids) and verbose:
+        print("  WARNING: duplicate Synapse objects in brain._all_synapses")
+
+    # per-neuron degrees
+    idx = {n: i for i, n in enumerate(neurons)}
+    in_deg = _np.zeros(N, dtype=int)
+    out_deg = _np.zeros(N, dtype=int)
+    exc = inh = 0
+    for s in syns:
+        out_deg[idx[s.pre]] += 1
+        in_deg[idx[s.post]] += 1
+        if s.synapse_type == 'excitatory':
+            exc += 1
+        else:
+            inh += 1
+
+    exc_pct = (exc / S * 100.0) if S > 0 else 0.0
+    inh_pct = (inh / S * 100.0) if S > 0 else 0.0
+    if verbose:
+        print(f"  Excitatory: {exc} ({exc_pct:.1f}%), Inhibitory: {inh} ({inh_pct:.1f}%)")
+        print(f"  In-degree per neuron: min={int(in_deg.min())}, median={int(_np.median(in_deg))}, mean={in_deg.mean():.2f}, max={int(in_deg.max())}")
+        print(f"  Out-degree per neuron: min={int(out_deg.min())}, median={int(_np.median(out_deg))}, mean={out_deg.mean():.2f}, max={int(out_deg.max())}")
+
+    # region->region matrix
+    region_list = brain.regions
+    R = len(region_list)
+    region_index = {r.name: i for i, r in enumerate(region_list)}
+    region_of = {}
+    for r in region_list:
+        for n in r.neurons:
+            region_of[n] = r.name
+
+    mat = _np.zeros((R, R), dtype=int)
+    for s in syns:
+        pre_reg = region_of.get(s.pre)
+        post_reg = region_of.get(s.post)
+        if pre_reg is None or post_reg is None:
+            continue
+        mat[region_index[pre_reg], region_index[post_reg]] += 1
+
+    if verbose:
+        names = [r.name for r in region_list]
+        print("  Region->Region matrix:")
+        print("    " + " ".join(f"{n[:10]:>10s}" for n in names))
+        for i, row in enumerate(mat):
+            print(f"    {names[i][:10]:>10s} " + " ".join(f"{c:10d}" for c in row))
+
+    # connected components (undirected)
+    adj = {n: set() for n in neurons}
+    for s in syns:
+        adj[s.pre].add(s.post); adj[s.post].add(s.pre)
+    visited = set(); components = []
+    for n in neurons:
+        if n in visited: continue
+        stack = [n]; comp = set()
+        while stack:
+            cur = stack.pop()
+            if cur in visited: continue
+            visited.add(cur); comp.add(cur)
+            for nb in adj[cur]:
+                if nb not in visited:
+                    stack.append(nb)
+        components.append(comp)
+    comp_sizes = sorted([len(c) for c in components], reverse=True)
+    largest_pct = (comp_sizes[0] / N * 100.0) if N > 0 and comp_sizes else 0.0
+    if verbose:
+        print(f"  Connected components: {len(components)}; largest={comp_sizes[0] if comp_sizes else 0} ({largest_pct:.1f}%)")
+        if len(components) > 1:
+            print("  Component sizes (top 5):", comp_sizes[:5])
+
+    return dict(N=N, S=S, regions=[r.name for r in region_list], in_deg=in_deg, out_deg=out_deg, matrix=mat, component_sizes=comp_sizes)
+
+
+def dedupe_synapses(brain, verbose=True):
+    """Remove duplicate synapses from `brain._all_synapses`, region.internal_synapses,
+    and projection lists. Duplicates are detected by (pre.id, post.id, syn_type, weight, delay).
+    Returns number of removed synapses.
+    """
+    removed = 0
+    seen = set()
+    new_all = []
+    for s in list(brain._all_synapses):
+        key = (getattr(s.pre, 'id', id(s.pre)), getattr(s.post, 'id', id(s.post)),
+               s.synapse_type, round(float(s.weight), 6), int(s.delay))
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        new_all.append(s)
+
+    if removed > 0:
+        brain._all_synapses.clear()
+        brain._all_synapses.extend(new_all)
+
+    # Deduplicate region.internal_synapses lists
+    for region in brain.regions:
+        new_internal = []
+        seen_local = set()
+        for s in getattr(region, 'internal_synapses', []):
+            key = (getattr(s.pre, 'id', id(s.pre)), getattr(s.post, 'id', id(s.post)),
+                   s.synapse_type, round(float(s.weight), 6), int(s.delay))
+            if key in seen_local:
+                continue
+            seen_local.add(key)
+            new_internal.append(s)
+        region.internal_synapses = new_internal
+
+    # Deduplicate projection_map syn lists
+    new_proj = []
+    for pre, post, ptype, syns in list(brain._projection_map):
+        uniq = []
+        seen_local = set()
+        for s in syns:
+            key = (getattr(s.pre, 'id', id(s.pre)), getattr(s.post, 'id', id(s.post)),
+                   s.synapse_type, round(float(s.weight), 6), int(s.delay))
+            if key in seen_local:
+                continue
+            seen_local.add(key)
+            uniq.append(s)
+        new_proj.append((pre, post, ptype, uniq))
+    brain._projection_map = new_proj
+
+    if verbose:
+        print(f"dedupe_synapses: removed {removed} duplicate synapses")
+    return removed
+
+
+def biophysical_current_recommendations():
+    """Return approximate current (pA) recommendations for target firing rates
+    calibrated previously for the `BrainNeuron(biophysical=True)` model.
+    These are rough guides — run `test_single_neuron_fI(biophysical=True)` for
+    precise calibration on your machine / parameter set.
+    """
+    return {
+        1: 151.4,
+        5: 153.2,
+        10: 154.4,
+        20: 169.7,
+        50: 275.3,
+        100: 581.1,
+    }
+
+
+def scale_and_benchmark(scales=(1, 5, 10, 20), fanout=8, steps=200, biophysical=False, outgoing_fanout=2):
+    results = []
+    for scale in scales:
+        t0 = time.perf_counter()
+        brain = build_scaled_brain(scale=scale, fanout=fanout, biophysical=biophysical, outgoing_fanout=outgoing_fanout)
+        build_time = time.perf_counter() - t0
+        # run quick connectivity validation to ensure internal synapses are registered
+        try:
+            validate_connectivity(brain)
+        except Exception as _e:
+            print("validate_connectivity failed:", _e)
+
+        # attempt to remove accidental duplicates before benchmarking
+        try:
+            removed = dedupe_synapses(brain, verbose=False)
+            if removed > 0:
+                print(f"  NOTE: deduped {removed} synapses before benchmarking")
+        except Exception as _e:
+            print("dedupe_synapses failed:", _e)
+
+        N = len(brain._all_neurons)
+        S = len(brain._all_synapses)
+        print(f"Scale={scale}: built brain with {N} neurons, {S} synapses (build {build_time:.2f}s)")
+
+        t1 = time.perf_counter()
+        # use the fast path to step the network
+        run_fast_simulation(brain, STEPS=steps, dt=1.0, record_history=False)
+        run_time = time.perf_counter() - t1
+        print(f"  Simulation: {steps} steps -> {run_time:.2f}s ({run_time/steps*1000:.2f} ms/step)")
+        results.append((scale, N, S, build_time, run_time))
+    return results
+
+# ======================================================================
+#  COLOR SCHEME
+# ======================================================================
+REGION_COLORS = {
+    "Thalamus":       {"excitatory": "#a5d6a7", "inhibitory": "#ef9a9a"},
+    "Cortex":         {"excitatory": "#4fc3f7", "inhibitory": "#ff8a65"},
+    "Hippocampus":    {"excitatory": "#ffcc02", "inhibitory": "#ce93d8"},
+    "Striatum D1":    {"excitatory": "#ffab40", "inhibitory": "#ffab40"},
+    "Striatum D2":    {"excitatory": "#ff6e40", "inhibitory": "#ff6e40"},
+    "GPe":            {"excitatory": "#b2dfdb", "inhibitory": "#b2dfdb"},
+    "GPi":            {"excitatory": "#80cbc4", "inhibitory": "#80cbc4"},
+    "STN":            {"excitatory": "#f48fb1", "inhibitory": "#f48fb1"},
+}
+PROJECTION_COLORS = {
+    "feedforward": "#69f0ae",
+    "feedback":    "#ff6e6e",
+    "modulatory":  "#b39ddb",
+}
+
+# ======================================================================
+#  SIMULATION – V16 (Serotonin)
+# ======================================================================
+if __name__ == "__main__":
+    import matplotlib
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    import matplotlib.patches as mpatches
+    from scipy.ndimage import gaussian_filter1d
+
+    np.random.seed(42)
+
+    brain = Brain()
+
+    thalamus = brain.add_region(Thalamus(
+        name="Thalamus", n_relay=8, n_trn=4, p_connect=0.20,
+        target_rate_i=18.0))
+
+    cortex = brain.add_region(BrainRegion(
+        name="Cortex", n_excitatory=18, n_inhibitory=4,
+        p_connect=0.30, recurrent=False,
+        target_rate_i=18.0,
+        interneuron_types=["PV", "PV", "SST", "VIP"]))
+
+    hippocampus = brain.add_region(BrainRegion(
+        name="Hippocampus", n_excitatory=15, n_inhibitory=3,
+        p_connect=0.35, recurrent=True,
+        target_rate=10.0, target_rate_i=13.0,
+        interneuron_types=["PV", "SST", "VIP"]))
+
+    striatum_d1 = brain.add_region(StriatumD1(
+        name="Striatum D1", n_neurons=8, p_connect=0.20))
+    striatum_d2 = brain.add_region(StriatumD2(
+        name="Striatum D2", n_neurons=8, p_connect=0.20))
+    gpe = brain.add_region(GPe(name="GPe", n_neurons=4, p_connect=0.25))
+    gpi = brain.add_region(GPi(name="GPi", n_neurons=4))
+    stn = brain.add_region(STN(name="STN", n_neurons=4, p_connect=0.15))
+
+    # Existing projections
+    brain.connect(thalamus, cortex, projection_type="feedforward", n_connections=36)
+    brain.connect(cortex, thalamus, projection_type="feedback", n_connections=8,
+                  target="inhibitory")
+    brain.connect(cortex, hippocampus, projection_type="feedforward", n_connections=30)
+    brain.connect(hippocampus, cortex, projection_type="feedback", n_connections=18)
+
+    # Basal ganglia projections
+    brain.connect(cortex, striatum_d1, projection_type="feedforward", n_connections=24,
+                  dopamine_receptor='D1')
+    brain.connect(cortex, striatum_d2, projection_type="feedforward", n_connections=24,
+                  dopamine_receptor='D2')
+    brain.connect(cortex, stn, projection_type="feedforward", n_connections=12)
+    brain.connect(striatum_d1, gpi, projection_type="feedforward", n_connections=16,
+                  target="input")
+    brain.connect(striatum_d2, gpe, projection_type="feedforward", n_connections=12,
+                  target="input")
+    brain.connect(gpe, stn, projection_type="feedforward", n_connections=8, target="input")
+    brain.connect(stn, gpe, projection_type="feedforward", n_connections=8, target="input")
+    brain.connect(gpe, gpi, projection_type="feedforward", n_connections=8, target="input")
+    brain.connect(stn, gpi, projection_type="feedforward", n_connections=12, target="input")
+    brain.connect(gpi, thalamus, projection_type="feedback", n_connections=12,
+                  target="inhibitory")
+
+    STEPS = 5000
+    times  = np.arange(STEPS)
+
+    spike_times_map = {n: [] for n in brain._all_neurons}
+    pop_activity    = {r: np.zeros(STEPS) for r in brain.regions}
+    proj_weight_hist = {}
+    for pre, post, ptype, syns in brain._projection_map:
+        key = f"{pre.name}→{post.name}"
+        proj_weight_hist[key] = {s: [] for s in syns}
+
+    print(f"Running long simulation ({STEPS} ms) with Serotonin (V16)...")
+    for t in range(STEPS):
+        if t % 10 == 0:
+            if brain.state == "wake":
+                brain.present(0.25)
+            else:
+                brain.present(0.25 * 0.1)
+
+        fired = brain.step(t)
+
+        for n in fired:
+            spike_times_map[n].append(t)
+
+        for region in brain.regions:
+            pop_activity[region][t] = sum(1 for n in region.neurons if n in fired)
+
+        for pre, post, ptype, syns in brain._projection_map:
+            key = f"{pre.name}→{post.name}"
+            for s in syns:
+                proj_weight_hist[key][s].append(s.weight)
+
+    brain.stats()
+
+    print("\nBiological target validation (last 500 ms of run):")
+    print(f"  {'Region':20s} {'Neuron type':15s} {'Hz':>8}  {'Target':>16}  {'Pass':>5}")
+    print(f"  {'-'*70}")
+
+    def hz_final(neurons, start_ms):
+        rates = []
+        for n in neurons:
+            cnt = sum(1 for spike in n.spike_times if spike >= start_ms)
+            rates.append(cnt / 0.5)
+        return np.mean(rates), np.std(rates)
+
+    checks = [
+        (thalamus.excitatory,   "Thalamus relay E",   8,  20),
+        (thalamus.inhibitory,   "Thalamus TRN I",     10, 35),
+        (cortex.input_neurons,  "Cortex input E",     12, 30),
+        (cortex.excitatory,     "Cortex all E",       5,  25),
+        (cortex.inhibitory,     "Cortex I",           8,  30),
+        (hippocampus.excitatory,"Hippocampus E",      3,  20),
+        (hippocampus.inhibitory,"Hippocampus I",      3,  25),
+    ]
+    all_pass = True
+    for neurons, label, lo, hi in checks:
+        mean_hz, _ = hz_final(neurons, STEPS - 500)
+        passed = lo <= mean_hz <= hi
+        all_pass = all_pass and passed
+        flag = "✓" if passed else "✗"
+        print(f"  {label:35s}  {mean_hz:5.1f} Hz  [{lo:2d}–{hi:2d} Hz target]  {flag}")
+
+    hip_std = np.std([n.firing_rate for n in hippocampus.excitatory])
+    hip_var_pass = hip_std > 1.5
+    all_pass = all_pass and hip_var_pass
+    print(f"  {'Hippocampus E spike variance':35s}  {hip_std:5.2f} std  [> 1.5 target]     "
+          f"{'✓' if hip_var_pass else '✗'}")
+    print(f"\n  Overall: {'ALL TARGETS MET' if all_pass else 'SOME TARGETS MISSED'}\n")
+
+    # Plotting
+    plt.style.use("dark_background")
+    fig = plt.figure(figsize=(18, 16))
+    fig.patch.set_facecolor("#0d0d0d")
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.50, wspace=0.35,
+                           left=0.06, right=0.97, top=0.92, bottom=0.06,
+                           height_ratios=[1.6, 1, 1])
+    ax_raster  = fig.add_subplot(gs[0, :])
+    ax_psth    = fig.add_subplot(gs[1, 0])
+    ax_voltage = fig.add_subplot(gs[1, 1])
+    ax_weights = fig.add_subplot(gs[1, 2])
+    ax_bars    = fig.add_subplot(gs[2, 0])
+    ax_diagram = fig.add_subplot(gs[2, 1:])
+
+    BG   = "#0d0d0d"
+    GRID = "#222222"
+
+    neuron_list = brain._all_neurons
+    n_total = len(neuron_list)
+    for row_idx, neuron in enumerate(neuron_list):
+        region = next(r for r in brain.regions if neuron in r.neurons)
+        is_exc = neuron in region.excitatory
+        palette = REGION_COLORS.get(region.name, {"excitatory":"#fff","inhibitory":"#888"})
+        color = palette["excitatory"] if is_exc else palette["inhibitory"]
+        spikes = spike_times_map[neuron]
+        if spikes:
+            ax_raster.scatter(spikes, [row_idx]*len(spikes), s=3, color=color,
+                              marker="|", linewidths=0.7, zorder=3)
+    cumulative = 0
+    for region in brain.regions:
+        n = len(region.neurons)
+        if cumulative > 0:
+            ax_raster.axhline(cumulative-0.5, color="#444", linewidth=0.8, linestyle="--")
+        palette = REGION_COLORS.get(region.name, {"excitatory":"#fff"})
+        ax_raster.text(STEPS*1.002, cumulative + n*0.5 - 0.5,
+                       region.name, va="center", fontsize=7, color=palette["excitatory"])
+        cumulative += n
+    ytick_labels = []
+    for n in neuron_list:
+        region = next(r for r in brain.regions if n in r.neurons)
+        kind = "E" if n in region.excitatory else "I"
+        int_str = f" {n.cell_type}" if kind == "I" else ""
+        ytick_labels.append(f"{n}[{kind}{int_str}]")
+    ax_raster.set_yticks(range(n_total))
+    ax_raster.set_yticklabels(ytick_labels, fontsize=4)
+    ax_raster.set_xlim(0, STEPS); ax_raster.set_ylim(-0.5, n_total-0.5)
+    ax_raster.set_xlabel("Time (ms)", fontsize=9)
+    ax_raster.set_title(f"Spike Raster ({STEPS} ms, V16 Serotonin)", fontsize=8.5, color="#aaaaaa")
+    ax_raster.set_facecolor(BG); ax_raster.grid(axis="x", color=GRID, linewidth=0.4)
+
+    sigma = 8.0
+    for region in brain.regions:
+        color = REGION_COLORS.get(region.name, {"excitatory":"#fff"})["excitatory"]
+        smooth = gaussian_filter1d(pop_activity[region].astype(float), sigma=sigma)
+        ax_psth.fill_between(times, smooth, alpha=0.15, color=color)
+        ax_psth.plot(times, smooth, color=color, linewidth=1.0, label=region.name)
+    ax_psth.set_xlabel("Time (ms)"); ax_psth.set_ylabel("Spikes / ms (smoothed)")
+    ax_psth.set_title(f"Population Firing Rate (PSTH, σ={sigma}ms)")
+    ax_psth.legend(fontsize=5, framealpha=0.2); ax_psth.set_xlim(0, STEPS)
+    ax_psth.set_facecolor(BG); ax_psth.grid(color=GRID, linewidth=0.4)
+
+    for neuron, color, label in [
+        (thalamus.excitatory[0], REGION_COLORS["Thalamus"]["excitatory"], "Thalamus relay (T)"),
+        (cortex.input_neurons[0], REGION_COLORS["Cortex"]["excitatory"], "Cortex L4 input"),
+        (hippocampus.excitatory[2], REGION_COLORS["Hippocampus"]["excitatory"], "Hippo recurrent")]:
+        v = np.array(neuron.v_history)
+        ax_voltage.plot(times[:len(v)], v, color=color, linewidth=0.85, alpha=0.85, label=label)
+    ax_voltage.axhline(cortex.excitatory[0].base_threshold, color="#fff", linewidth=0.6, linestyle=":")
+    ax_voltage.set_xlabel("Time (ms)"); ax_voltage.set_ylabel("Membrane potential")
+    ax_voltage.set_title("Voltage Traces (LIF)"); ax_voltage.legend(fontsize=6.5, framealpha=0.2)
+    ax_voltage.set_xlim(0, STEPS); ax_voltage.set_facecolor(BG); ax_voltage.grid(color=GRID, linewidth=0.4)
+
+    for pre, post, ptype, syns in brain._projection_map:
+        key = f"{pre.name}→{post.name}"
+        color = PROJECTION_COLORS.get(ptype, "#ffffff")
+        for i, (s, w_hist) in enumerate(proj_weight_hist[key].items()):
+            ax_weights.plot(times, w_hist, color=color, linewidth=0.7, alpha=0.5,
+                            label=f"{key} [{ptype}]" if i==0 else "_")
+    ax_weights.set_xlabel("Time (ms)"); ax_weights.set_ylabel("Weight")
+    ax_weights.set_title("Inter-region Weight Evolution (ACh+DA+5HT modulated)")
+    ax_weights.legend(fontsize=4.5, framealpha=0.2)
+    ax_weights.set_xlim(0, STEPS); ax_weights.set_ylim(0, 1)
+    ax_weights.set_facecolor(BG); ax_weights.grid(color=GRID, linewidth=0.4)
+
+    bar_labels, bar_values, bar_colors = [], [], []
+    region_boundaries = []; cumulative = 0
+    for region in brain.regions:
+        palette = REGION_COLORS.get(region.name, {"excitatory":"#fff","inhibitory":"#888"})
+        for n in region.neurons:
+            is_exc = n in region.excitatory
+            bar_labels.append(str(n))
+            bar_values.append(n.firing_rate)
+            bar_colors.append(palette["excitatory"] if is_exc else palette["inhibitory"])
+        region_boundaries.append((cumulative, len(region.neurons), region.name, palette["excitatory"]))
+        cumulative += len(region.neurons)
+    x_pos = np.arange(len(bar_labels))
+    ax_bars.bar(x_pos, bar_values, color=bar_colors, edgecolor="#333", linewidth=0.3, width=0.7)
+    max_v = max(bar_values) if bar_values else 1
+    for start, count, rname, rcolor in region_boundaries:
+        if start > 0:
+            ax_bars.axvline(start-0.5, color="#444", linewidth=0.8, linestyle="--")
+        ax_bars.text(start+count*0.5-0.5, max_v*0.95, rname, ha="center", fontsize=5.5, color=rcolor)
+    ax_bars.set_xticks(x_pos); ax_bars.set_xticklabels(bar_labels, rotation=90, fontsize=4)
+    ax_bars.set_ylabel("Total spikes"); ax_bars.set_title("Spike Count per Neuron")
+    ax_bars.set_facecolor(BG); ax_bars.grid(axis="y", color=GRID, linewidth=0.4)
+
+    ax_diagram.set_xlim(0, 10); ax_diagram.set_ylim(0, 4)
+    ax_diagram.set_facecolor(BG); ax_diagram.axis("off")
+    ax_diagram.set_title("Circuit Architecture", fontsize=9, color="#aaaaaa")
+    box_specs = [
+        (1.0, 3.3, "Thalamus", "Thalamus", "8 relay (T)\n4 TRN"),
+        (3.0, 3.3, "Cortex", "Cortex", "L4→L2/3→L5/6\n18E + 4I"),
+        (5.0, 3.3, "Hippocampus", "Hippocampus", "15E + 3I\nrecurrent"),
+        (3.0, 1.8, "Striatum D1", "Striatum D1", "8 MSNs (D1)"),
+        (5.0, 1.8, "Striatum D2", "Striatum D2", "8 MSNs (D2)"),
+        (5.0, 0.8, "GPe", "GPe", "4 cells"),
+        (3.0, 0.8, "STN", "STN", "4 cells"),
+        (1.0, 1.5, "GPi", "GPi", "4 cells"),
+    ]
+    box_w, box_h = 1.5, 0.7
+    box_positions = {}
+    for cx, cy, name, rk, detail in box_specs:
+        ec = REGION_COLORS.get(rk, {"excitatory":"#fff"})["excitatory"]
+        rect = mpatches.FancyBboxPatch((cx-box_w/2, cy-box_h/2), box_w, box_h,
+                                       boxstyle="round,pad=0.05", facecolor="#1a1a1a",
+                                       edgecolor=ec, linewidth=1.2)
+        ax_diagram.add_patch(rect)
+        ax_diagram.text(cx, cy, name, ha="center", va="center", fontsize=6, fontweight="bold", color=ec)
+        box_positions[name] = (cx, cy)
+
+    fig.suptitle(f"Brain Simulation — V16 Serotonin  |  {STEPS} ms",
+                 fontsize=13, color="white", y=0.96)
+    
+    fig.savefig("brain_sim_long_V16.png", dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.show()
+    print("Plot saved → brain_sim_long_V16.png (also shown above)")
